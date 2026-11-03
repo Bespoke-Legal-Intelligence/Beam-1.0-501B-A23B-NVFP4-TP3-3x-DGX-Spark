@@ -1,0 +1,14 @@
+[Unit]
+Description=GB10 GPU clock cap 300-2300 MHz v1.0.1 (hard power-off mitigation)
+Wants=nvidia-persistenced.service
+After=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sh -c 'n=0; until /usr/bin/nvidia-smi -L >/dev/null 2>&1; do n=$$((n+1)); [ $$n -ge 30 ] && exit 1; sleep 2; done'
+ExecStart=-/usr/bin/nvidia-smi -pm 1
+ExecStart=/usr/bin/nvidia-smi -lgc 300,2300
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

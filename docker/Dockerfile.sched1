@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Scheduler image for node0 (v2 recipe): beam-tp3:v1 (docker/Dockerfile) plus one edited function in vLLM's engine.
+# vLLM's scheduler can already pause a partly-read prompt for a few steps so requests that are writing get decode-only
+# steps (scheduler.py: defer_prefills), but in this build only the data-parallel engine ever turns it on
+# (core.py: EngineCore._should_throttle_prefills "never throttles otherwise"). The patcher makes the single-replica
+# engine honour --prefill-schedule-interval N as well. With N unset or 1, behaviour is unchanged.
+# The build checks the file's SHA-256 before and after (the values we built and measured with), and the patcher refuses
+# to write unless it finds the original function exactly once, so the build fails rather than patching other code. Only node0 runs the engine; the workers keep beam-tp3:v1.
+# NOTICE (Apache-2.0 section 4(b)): this build modifies vllm/v1/engine/core.py.
+# Build from the repo root, with the default docker builder (the base image is local):
+#   docker build --progress=plain -t beam-tp3:v1-sched1 -f docker/Dockerfile.sched1 docker/
+FROM beam-tp3:v1
+COPY beam_sched1_patcher_v1_0_1.py /tmp/beam_sched1_patcher_v1_0_1.py
+RUN set -e; \
+    F="$(python3 -c 'import importlib.util as u; print(u.find_spec("vllm").submodule_search_locations[0])')/v1/engine/core.py"; \
+    echo "20e44418e3db7c12d6333a0a227eeeb606cb5bcd93bd9dc44326a1c480099611  $F" | sha256sum -c; \
+    python3 -I /tmp/beam_sched1_patcher_v1_0_1.py "$F" "$F"; \
+    echo "675dc58ac841fc3ac8f3811385e26a2def8d71f77a5085c531897493f9d61b23  $F" | sha256sum -c; \
+    rm -f "$(dirname "$F")"/__pycache__/core.cpython-*.pyc /tmp/beam_sched1_patcher_v1_0_1.py
+LABEL org.opencontainers.image.description="beam-tp3:v1 plus EngineCore._should_throttle_prefills honouring --prefill-schedule-interval on a single-replica engine" \
+      org.opencontainers.image.licenses="Apache-2.0"

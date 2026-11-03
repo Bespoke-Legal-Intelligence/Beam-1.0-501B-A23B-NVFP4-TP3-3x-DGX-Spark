@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: CC-BY-4.0 -->
 # Beam-1.0 501B on three DGX Sparks at TP=3
 
-Run Reflection's [Beam-1.0-501B-A23B](https://huggingface.co/reflection/Beam-1.0-501B-A23B-NVFP4) (NVFP4) across three NVIDIA DGX Spark (GB10) nodes with tensor parallelism 3, on a stock vLLM image with one constant changed.
+Run Reflection's [Beam-1.0-501B-A23B](https://huggingface.co/reflection/Beam-1.0-501B-A23B-NVFP4) (NVFP4) across three NVIDIA DGX Spark (GB10) nodes with tensor parallelism 3, on a stock vLLM image with one constant changed (v2 adds one edited engine function on node0; Step 4b).
 
-Beam has 8 key-value heads, and three other widths that don't divide by 3, so it cannot start at TP=3 as shipped. This repo pads the checkpoint offline with zeros so every split is even, shows analytically (under stated kernel assumptions) that the padded model computes the same function, and verifies the padded files byte by byte against the original. Then it walks through serving it on a switchless three-node ring, with a pass/fail check after every step. The only change to vLLM is one constant, patched into the pinned upstream image.
+Beam has 8 key-value heads, and three other widths that don't divide by 3, so it cannot start at TP=3 as shipped. This repo pads the checkpoint offline with zeros so every split is even, shows analytically (under stated kernel assumptions) that the padded model computes the same function, and verifies the padded files byte by byte against the original. Then it walks through serving it on a switchless three-node ring, with a pass/fail check after every step. The only change to vLLM in v1 is one constant, patched into the pinned upstream image; v2 also edits one engine function on node0 (Step 4b).
 
 **Measured on our cluster:**
 - about 18 tokens/s single-stream decode;
@@ -17,28 +17,63 @@ To the best of our knowledge, this is the first public recipe for running Reflec
 
 > Not affiliated with or endorsed by NVIDIA or Reflection AI. NVIDIA, DGX Spark, GB10 and ConnectX are trademarks of NVIDIA Corporation; Beam is Reflection AI's model. Names are used only to describe what this was run on.
 
+## What's new in v2 (Nov 2, 2026)
+
+Same padded checkpoint (no re-download; `SHA256SUMS` unchanged), same base image. What changed is how it is run:
+
+| Measured on our cluster (Oct 28–31, same nodes; one run each) | Before (2,048-token steps, no cap, no interval; pool row: v1's automatic sizing) | After (v2 settings) |
+|---|---|---|
+| KV-cache pool | 178,253–180,048 tokens on Oct 21 (about 1.4 full 131K requests) | **524,552 tokens (4.0 full 131K requests)** |
+| Same document, new question after a long answer | full re-read (51.2 s for 100K tokens) | **0.5 s** with `RETENTION=4096` (measured at 2,048-token steps with the other v2 settings off; a branch can re-read up to about 4K tokens, about 2 s, calculated) |
+| A one-line question sent 2 s after a 100K-token prompt | waited for the whole read (49.4 s) | **4.6 s** |
+| Two requests already writing while a 100K-token prompt is read | 1.08 tokens/s each | **3.97 tokens/s each** (that read: 65.0 s, against 46.4 s for the same read with nothing else running) |
+| Reading one 100K-token prompt | 50.9 s | **46.4 s** |
+| One request writing | 18.2 tokens/s | 19.2 tokens/s (unchanged within the spread of our three runs, 18.2–20.1, at different settings; 17.7–18.5 after the Nov 1 clock cap) |
+| Stopping | `docker rm -f`, then reboot every node | **graceful stop returned the memory on every stop we recorded (Oct 28–31); no reboot** |
+| Start / stop | three terminals | **one command each from node0** (scripts: Steps 6 and 8) |
+
+How:
+- **The KV cache is pinned** (`--kv-cache-memory-bytes`) instead of estimated, so its size no longer swings between launches.
+- **Sliding-window cache checkpoints** every 4,096 tokens (`--prefix-cache-retention-interval`), so a document stays cached after a long answer.
+- **4,096-token steps** (`--max-num-batched-tokens`) with a **cap on any one long prompt** while other requests are present (`--long-prefill-token-threshold 3584`), so a new request can start in the next step instead of waiting for the whole read.
+- **Decode-only steps between chunks of a long prompt** (`--prefill-schedule-interval 9`). vLLM already has this mechanism, but in this build only its data-parallel engine turns it on; `docker/Dockerfile.sched1` edits one function so the single-replica engine honours the setting too.
+- **Graceful stop and one-command start/stop** (`scripts/start_all_v1_0_1.sh`, `scripts/stop_all_v1_0_1.sh`).
+- **After a power-off (Nov 1, unproven as a fix):** the same SoC and Embedded Controller firmware on every node and a GPU clock cap, after one node switched off under load during a soak; while in the firmware setup we also cut display memory from 2 GB to 0.5 GB (about 1.5 GiB more memory per node; unrelated to the power-off). See [Step 0b](#step-0b-firmware-display-memory-and-a-gpu-clock-cap-what-we-changed-on-nov-1).
+
+**Beam as a legal agent on this cluster (Oct 24 – Nov 2):** on 16 litigation tasks of Harvey's Legal Agent Benchmark, Beam in Harvey's own harness passed 760 of 841 rubric criteria (0.904). A self-hosted agent served with the v2 settings at a 262,144-token context matched it on 6 probe tasks (261 of 286 criteria for both, majority of 3 gradings; a second agent run, 255), and fusing the two agent drafts into one deliverable scored 267 of 286. On 4 held-out tasks drawn at random: fusion 209 of 226, bare Beam 194; on all 10 tasks: fusion 476 of 512 (0.930), bare Beam 455 (0.889). Method, every number and the limits: [results/legal_agent_eval_20261102/README.md](results/legal_agent_eval_20261102/README.md).
+
+Details: [Concurrency and long prompts](#concurrency-and-long-prompts), [Memory margin](#memory-margin), [v2 results](results/v2_20261031/README.md), [legal agent results](results/legal_agent_eval_20261102/README.md), [CHANGELOG](CHANGELOG.md). Upgrading from v1:
+1. `git pull` this repo on all three nodes (the workers run `scripts/launch_node_v0_2_1.sh` from their own copy).
+2. Create `scripts/cluster.conf` on node0 and choose `KV_BYTES` ([Choosing the KV-cache size](#choosing-the-kv-cache-size)). Leave `GPU_UTIL` unset: `start_all` derives it from the memory total, which matters if you lower Display Reserved Memory ([Step 0b](#step-0b-firmware-display-memory-and-a-gpu-clock-cap-what-we-changed-on-nov-1)).
+3. Stop the v1 server gracefully with `scripts/stop_all_v1_0_1.sh` (Step 8), not `docker rm -f`. Reboot a node only if the script reports `MEM_HELD` there, or if the server was already killed with `docker rm -f`.
+4. Build the scheduler image on node0 (Step 4b).
+5. Start (Step 6).
+
 ## Contents
 
-1. [Tested on](#tested-on)
-2. [What you need](#what-you-need)
-3. [Step 0: prepare every node](#step-0-prepare-every-node)
-4. [Step 1: ring network](#step-1-ring-network)
-5. [Step 2: download and verify the checkpoint](#step-2-download-and-verify-the-checkpoint)
-6. [Step 3: pad, verify and test](#step-3-pad-verify-and-test)
-7. [Step 4: build the serving image](#step-4-build-the-serving-image)
-8. [Step 5: copy to the other nodes](#step-5-copy-to-the-other-nodes)
-9. [Step 6: launch](#step-6-launch)
-10. [Step 7: smoke tests](#step-7-smoke-tests)
-11. [Results](#results)
-12. [Why it is built this way](#why-it-is-built-this-way)
-13. [Troubleshooting](#troubleshooting)
-14. [Limitations](#limitations)
-15. [Related work and other builds](#related-work-and-other-builds)
-16. [Credits, citation and licence](#credits-citation-and-licence)
+1. [What's new in v2](#whats-new-in-v2-nov-2-2026)
+2. [Tested on](#tested-on)
+3. [What you need](#what-you-need)
+4. [Step 0: prepare every node](#step-0-prepare-every-node) (and [Step 0b: firmware, display memory and a GPU clock cap](#step-0b-firmware-display-memory-and-a-gpu-clock-cap-what-we-changed-on-nov-1))
+5. [Step 1: ring network](#step-1-ring-network)
+6. [Step 2: download and verify the checkpoint](#step-2-download-and-verify-the-checkpoint)
+7. [Step 3: pad, verify and test](#step-3-pad-verify-and-test)
+8. [Step 4: build the serving image](#step-4-build-the-serving-image) (and [Step 4b: build the scheduler image](#step-4b-build-the-scheduler-image-node0-only-v2))
+9. [Step 5: copy to the other nodes](#step-5-copy-to-the-other-nodes)
+10. [Step 6: launch](#step-6-launch)
+11. [Step 7: smoke tests](#step-7-smoke-tests)
+12. [Step 8: stop and restart](#step-8-stop-and-restart)
+13. [Results](#results)
+14. [Concurrency and long prompts](#concurrency-and-long-prompts)
+15. [Why it is built this way](#why-it-is-built-this-way)
+16. [Troubleshooting](#troubleshooting)
+17. [Limitations](#limitations)
+18. [Related work and other builds](#related-work-and-other-builds)
+19. [Credits, citation and licence](#credits-citation-and-licence)
 
 ## Tested on
 
-All three nodes were identical. Recorded Oct 20, 2026, from the hosts and the running containers; nothing was changed before the last measurement on Oct 21.
+All three nodes ran the same kernel, driver and software; their SoC and Embedded Controller firmware differed until Nov 1 (below). Recorded Oct 20, 2026, from the hosts and the running containers; nothing was changed before the last measurement on Oct 21.
 
 | Component | Version |
 |---|---|
@@ -51,7 +86,9 @@ All three nodes were identical. Recorded Oct 20, 2026, from the hosts and the ru
 | Inside the image | vLLM 0.1.dev23042+g8e0922e88, PyTorch 2.13.0+cu130, FlashInfer 0.7.2.dev20261014 (includes the b12x MoE kernels), NCCL 2.30.7 (`nvidia-nccl-cu13`), transformers 5.19.0 |
 | Model | `reflection/Beam-1.0-501B-A23B-NVFP4`, revision `3bd1dccf13c8f7aa3d6732c5aaa48ba107a2c086`, Apache-2.0; 63 files, 293,654,927,078 bytes |
 
-Other driver, kernel or vLLM versions are untested.
+Other driver, kernel or vLLM versions are untested. The v2 measurements (Oct 28–31) used the same hardware and software, plus the scheduler image of Step 4b on node0. One node's `/etc/dgx-release` reads 7.6.0: it shipped with DGX OS 7.6.0 and was brought to the kernel and driver above before any measurement.
+
+**Changed on Nov 1 (Step 0b), on all three nodes:** SoC firmware `0x02009e0f`, Embedded Controller `0x03000508` (before: two nodes on `0x0200980f` / `0x03000302`, one on `0x02009b0b` / `0x03000508`), Display Reserved Memory 0.5 GB (was 2 GB) with `GPU_UTIL=0.874`, GPU clock capped at 2,300 MHz. Kernel, driver, ConnectX-7 firmware, USB-C power-delivery firmware, images and checkpoint unchanged. Measurements after these changes are labelled as such.
 
 ## What you need
 
@@ -80,7 +117,7 @@ Run every command in this guide from the repo root unless a step says otherwise.
 On **every** node:
 
 ```bash
-git clone https://github.com/Bespoke-ALI/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark && cd Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark
+git clone https://github.com/Bespoke-Legal-Intelligence/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark && cd Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark
 sudo apt install -y perftest=24.01.0+0.38-1build2 openmpi-bin=4.1.6-7ubuntu2 libopenmpi-dev=4.1.6-7ubuntu2 \
   libnccl2=2.30.7-1+cuda13.3 libnccl-dev=2.30.7-1+cuda13.3   # the versions we ran; NCCL from NVIDIA's CUDA apt repository
 sudo install -d -o "$USER" -g "$USER" /srv/models /opt/nccl-tests
@@ -94,6 +131,60 @@ make -C /opt/nccl-tests MPI=1 MPI_HOME=/usr/lib/aarch64-linux-gnu/openmpi CUDA_H
 **SSH.** From node0, `ssh-copy-id <user>@<node1-address>` and `ssh-copy-id <user>@<node2-address>` (for the NCCL test). From node0 and node2, also copy a key to node1, the build node (for Step 5).
 
 **Pass:** `ls /opt/nccl-tests/build/all_gather_perf` exists on every node, and `ssh -o BatchMode=yes <user>@<address> true` succeeds from node0 to both workers.
+
+### Step 0b: firmware, display memory and a GPU clock cap (what we changed on Nov 1)
+
+**Why.** On Oct 31, during a soak at the v2 settings, node0 switched itself off about 18 minutes in, with three requests running. It left nothing behind: no kernel error, no GPU error, no thermal message and no crash record; the other two nodes only saw their links to it drop. Other DGX Spark owners report the same log-less power-off under sustained GPU load, and what they report about fixes is mixed:
+- One owner's unit, starting from exactly our two older nodes' firmware, stopped powering off after a firmware update, but still failed NVIDIA's field diagnostic and an RMA was approved ([NVIDIA forum](https://forums.developer.nvidia.com/t/dgx-spark-gb10-partnerdiag-powerstress-reproducibly-hard-powers-off-the-box-acpitz-88-97-8-c-in-5s-all-other-field-tests-pass/377365)).
+- Another owner's ten power-offs in one day happened *on* the Embedded Controller version we moved to (`0x03000508`); they attribute them to a faulty thermal sensor (RMA requested) ([NVIDIA forum](https://forums.developer.nvidia.com/t/dgx-spark-log-less-hard-power-off-under-load-thermal-sensor-fault-firmware-up-to-date-matches-rmad-case-377365/385262)).
+- An eight-unit write-up reports that all its units were already on the latest firmware and still powered off; spacing out their taped-together power bricks reduced the power-offs but did not end them, and locking the GPU clock is the change after which they saw none ([write-up](https://petronellatech.com/blog/dgx-spark-shutdown-under-load-our-8-unit-gb10-diagnosis/)).
+
+On Nov 1 we made the changes below on all three nodes, one node at a time. **We have not shown that any of them prevents the power-off;** the soak after them is in [results/v2_20261031/README.md](results/v2_20261031/README.md). Parts 1 and 3 are aimed at the power-off; part 2 is only a memory gain we took while in the firmware setup. If power-offs continue, run NVIDIA's field diagnostic and contact NVIDIA support: the owners above with repeated power-offs were granted or requested RMAs.
+
+**1. Firmware: the same SoC and Embedded Controller versions on every node.** Firmware is the one change here you cannot undo from this repo. Keep the node on reliable power. NVIDIA's own [update guide](https://docs.nvidia.com/dgx/dgx-spark/os-and-component-update.html) installs the newest firmware (`fwupdmgr upgrade` or the DGX Dashboard), which would include Embedded Controller `0x03000d07`; we named versions instead, for the reason below.
+- Ours were mixed: two nodes on Embedded Controller `0x03000302` and SoC `0x0200980f`, one on `0x03000508` and `0x02009b0b`. We put all three on SoC `0x02009e0f` (October 2026; it adds the setting in part 2) and Embedded Controller `0x03000508`. We did not touch the USB-C power-delivery firmware (still `0x00000516` on one node, `0x00000001` on the other two) or the ConnectX-7 firmware.
+- **Why not the newest Embedded Controller, `0x03000d07`:** one owner reports, from one unit under a 20-core CPU load, that it ignores the host's fan requests and ran at 92 °C against 73 °C on `0x03000508`; another poster in the same thread says the newer version raises the minimum fan speed. It is unconfirmed by NVIDIA, so this is a judgement call, not a settled fact ([NVIDIA forum](https://forums.developer.nvidia.com/t/new-dgx-spark-fans-barely-speed-up-at-high-temps-and-cant-be-adjusted-critical-please-open-fan-control/386805?page=2)). The same owner's best guess is that the October SoC firmware and the older EC do not line up on one EC mailbox (it timed out for them); the October bundle pairs SoC `0x02009e0f` with EC `0x03000d07` ([kelchm/home-lab](https://github.com/kelchm/home-lab/issues/1030)). We saw no problem with our pair, though we did not test fan control.
+- **If you are already on `0x03000d07`,** staying there is reasonable. Going back to `0x03000508` is a downgrade (`fwupdmgr` needs `--allow-older`), which we have not done.
+- `fwupdmgr update` always takes the newest versions, so we named each one. Use the version string exactly as `fwupdmgr get-updates` prints it; on our nodes it printed, and accepted, the hex form:
+
+```bash
+sudo fwupdmgr refresh --force
+sudo fwupdmgr get-updates                     # each device's ID, current version and the versions on offer
+sudo fwupdmgr install <Embedded Controller device ID> 0x03000508 -y --no-reboot-check   # skip if already 0x03000508
+sudo fwupdmgr install <SoC "UEFI Device Firmware" device ID> 0x02009e0f -y --no-reboot-check
+sudo find /boot/efi -iname '*.cap' -printf '%TY-%Tm-%Td %TH:%TM %p\n'   # the update files waiting for the reboot
+sudo reboot
+```
+
+- **Before rebooting, read the list of waiting files.** On two of our nodes an old power-delivery update (`fwupd-dd1a238a-….cap`; on one of them dated May, in `/boot/efi/EFI/UpdateCapsule/`) was also waiting, never applied; it could have been applied together with ours. To change one thing at a time we copied it out of `/boot/efi` to our home folder and then removed it from `/boot/efi`. The files you just staged (one or two, depending on which versions the node already had; the UX capsule below may also be new) should carry today's date in the listing; an older-dated `.cap` was left by an earlier update. A `fwupd-3b8c8162-….cap` file, if present, is fwupd's update-progress screen (the UEFI "UX capsule"), not firmware; leave it. If you are unsure what a file is, leave all of them: the cost is that an older pending update may be applied in the same reboot.
+- **The firmware reboot is silent for several minutes** (6–7 on the two we timed). Do not remove power.
+- **Pass:** after the reboot `sudo fwupdmgr get-devices` shows the new versions, and Step 1's link checks pass.
+- **Later updates:** a later `fwupdmgr update` or DGX OS update can move the Embedded Controller to `0x03000d07`. Check `fwupdmgr get-devices` after any update.
+- If `fwupdmgr` fails with `libfwupd version … does not match daemon …`, the `fwupd` and `libfwupd` packages are out of step. On one of our nodes, installing Ubuntu's current `fwupd` (2.0.20) fixed it and changed nothing else (check with `apt-get -s install fwupd` first).
+
+**2. Display memory: 2 GB → 0.5 GB (memory gain, not a power-off fix).** This needs a monitor and keyboard on the node: don't do it over SSH on a node you cannot reach in person. With SoC `0x02009e0f` the firmware setup screen (hold Esc during boot; `sudo systemctl reboot --firmware-setup` should also work, but we have not confirmed it on a Spark) has a **Display Reserved Memory** setting under **Advanced**, default 2 GB. It may be missing on partner GB10 systems ([NVIDIA forum](https://forums.developer.nvidia.com/t/reclaim-2gib-of-ram-on-headless-sparks/384621)).
+- We chose 0.5 GB on each node and saved with **Save & Exit → Save Changes and Exit**. `MemTotal` rose by about 1.5 GiB (1,532–1,533 MiB) on every node (from 127,600,524–127,600,748 kB to 129,170,308 kB).
+- **`GPU_UTIL` must then drop to 0.874.** `scripts/start_all_v1_0_1.sh` does this for you when `cluster.conf` does not set `GPU_UTIL`; if you launch by hand, set it yourself. vLLM claims `GPU_UTIL` × the memory total at start-up, so the larger total raised its claim from 107.70 GiB (calculated) to 109.02 GiB, and our first start afterwards failed with `Free memory on device cuda:0 (108.87/123.19 GiB) on startup is less than desired GPU memory utilization (0.885, 109.02 GiB)`. With 0.874 (107.67 GiB) it started normally. In general, `GPU_UTIL` ≈ 107.7 ÷ (`MemTotal` in kB ÷ 1,048,576), rounded down to three decimals; vLLM's error message prints the total it sees (the figure after the slash). The KV cache is pinned separately, so nothing else changes.
+- "Auto" sizes the reserve from the displays detected at boot (another owner reports 0.5 GB with no display or one 1080p/1440p display, [kelchm/home-lab](https://github.com/kelchm/home-lab/issues/1030)); we chose the fixed 0.5 GB so the figure does not depend on what is plugged in.
+- Do not unplug or switch a monitor in the first few minutes after boot: one owner hung the GPU that way in 6 of 14 tries, at 2 GB as well as 0.5 GB, so the setting is not the cause ([kelchm/home-lab](https://github.com/kelchm/home-lab/issues/1030)).
+- **Undo:** set it back to 2 GB the same way. `start_all` re-derives `GPU_UTIL` (0.885); if you set 0.874 by hand, remove it.
+
+**3. GPU clock cap at 2,300 MHz,** installed as a start-up service from `scripts/gb10_clock_cap_v1_0_1.service`:
+
+```bash
+sudo cp scripts/gb10_clock_cap_v1_0_1.service /etc/systemd/system/gb10-clock-cap.service
+sudo systemctl daemon-reload && sudo systemctl enable --now gb10-clock-cap.service
+systemctl is-active gb10-clock-cap.service   # active
+nvidia-smi --query-gpu=clocks.gr,power.draw,temperature.gpu --format=csv -l 2   # watch it while the server is busy; Ctrl+C to stop
+```
+
+- **Why 2,300 MHz:** the eight-unit write-up (four DGX Sparks, four other GB10 systems) reports 0 power-offs in 448 long-prompt starts at 2,300 MHz, against 1 in 233 at default clocks once its power supplies had been separated (earlier, 2 in 22 on one unit). The write-up itself says the two rates are not a precise comparison and that counting alone cannot prove the cap is safer at a loss rate this low; it chose 2,300 MHz partly for thermal margin. That is their result, not ours.
+- **A lower cap has stronger single-unit evidence.** One owner reproduced the power-off on purpose on an ASUS GX10 (also GB10): uncapped, a heavy run switched off at 156 s; capped at 2,200 MHz (`nvidia-smi -lgc 300,2200`), the same run finished in 251 s, time at or above 95 °C fell from 12% to 0% and peak power from 93.2 to 74.0 W, at about 9% longer run time. The author calls it a workaround, not a fix ([ai-muninn, Sep 14](https://ai-muninn.com/en/blog/gx10-thermal-hard-poweroff); see also [this NVIDIA forum thread](https://forums.developer.nvidia.com/t/gb10-abruptly-powers-off-under-heavy-gpu-load-nvidia-smi-lgc-300-2200-prevents-it/384492)). We kept 2,300 MHz and have not measured 2,200 on our nodes. If a node still powers off at 2,300, change `2300` to `2200` in the service file's `ExecStart` line and reinstall it.
+- **What it costs in clock:** without the cap `nvidia-smi` reported a maximum of 3,003 MHz on our nodes, so this cuts the ceiling by 23%. Measured effect on serving: [results/v2_20261031/README.md](results/v2_20261031/README.md).
+- **Pass:** `systemctl is-active gb10-clock-cap.service` prints `active`, and under load the clock stays at or below 2,300 MHz. In a 25-second matrix-multiply test (our own, not published) our three GPUs ran at 2,210–2,275 MHz and 87–93 W (as `nvidia-smi` reports it) and idled at 305 MHz afterwards. We did not run the same test without the cap, so this does not by itself show the cap binding. The write-up notes that on its driver `nvidia-smi -q` does not show the lock.
+- **A GPU that sits near 611 MHz under load after a power loss or a reboot is stuck** (reported in the same write-up, on its non-NVIDIA GB10 units); a reboot does not clear it, removing AC power for about 15 s does.
+- **What we have and have not tested:** the measurements above were taken with the unit's first version (v1.0.0: no wait for the GPU, and the clock lock skipped if persistence mode failed), started with `enable --now`. v1.0.1 adds the wait and the fallback; it is installed on our nodes, but none has rebooted with it yet, so its start at boot is untested.
+- **Undo:** `sudo systemctl disable --now gb10-clock-cap.service && sudo nvidia-smi -rgc`.
 
 ## Step 1: ring network
 
@@ -189,10 +280,10 @@ mpirun -np 3 -H localhost:1,<node1-address>:1,<node2-address>:1 --mca plm_rsh_ag
 
 ## Step 2: download and verify the checkpoint
 
-**Shortcut: download the padded checkpoint instead (skips Steps 2 and 3).** The output of Step 3 is published at [Bespoke-ALI/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark](https://huggingface.co/Bespoke-ALI/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark). On the build node:
+**Shortcut: download the padded checkpoint instead (skips Steps 2 and 3).** The output of Step 3 is published at [Bespoke-Intelligence/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark](https://huggingface.co/Bespoke-Intelligence/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark). On the build node:
 
 ```bash
-REPO=Bespoke-ALI/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark
+REPO=Bespoke-Intelligence/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark
 REV=main      # or pin a commit from the repo's history
 DST=/srv/models/tp3/Beam-1.0-501B-A23B-NVFP4-TP3
 mkdir -p "$DST"
@@ -303,6 +394,21 @@ docker run --rm --network none --entrypoint python3 beam-tp3:v1 -c 'import impor
 - **The build fails on purpose** if the upstream line ever changes.
 - **Image IDs embed a build timestamp,** so yours will differ from ours. Compare the file content, not the ID.
 
+### Step 4b: build the scheduler image (node0 only, v2)
+
+**Run this on node0 after Step 5.** It builds on top of `beam-tp3:v1`, which node0 only receives in Step 5; before that, Docker tries to download a `beam-tp3:v1` from Docker Hub and the build fails. (Upgrading from v1, node0 already has it.)
+
+```bash
+docker build --progress=plain -t beam-tp3:v1-sched1 -f docker/Dockerfile.sched1 docker/
+docker run --rm --network none --entrypoint sh beam-tp3:v1-sched1 -c 'F=$(python3 -c "import importlib.util as u; print(u.find_spec(\"vllm\").submodule_search_locations[0])")/v1/engine/core.py; sha256sum "$F"; grep -c "LOCAL PATCH sched1" "$F"'
+```
+
+- **Pass:** the build prints `ORIGINAL_SHA 20e44418e3db7c12d6333a0a227eeeb606cb5bcd93bd9dc44326a1c480099611`, `PATCHED_SHA 675dc58ac841fc3ac8f3811385e26a2def8d71f77a5085c531897493f9d61b23` and `PATCH=OK lines 2717 -> 2728`; the check prints that same patched hash and `2`.
+- **What it changes:** one function, `EngineCore._should_throttle_prefills` in `vllm/v1/engine/core.py` (11 added lines). It returns the same `False` as before unless `--prefill-schedule-interval` is above 1. See [Concurrency and long prompts](#concurrency-and-long-prompts).
+- **The build fails on purpose** if `core.py` is not byte-identical to the pinned image's (a SHA-256 check runs first and prints `core.py: FAILED`), and the patcher also refuses unless it finds the function exactly once.
+- Only node0 needs it; node1 and node2 run model shards only and keep `beam-tp3:v1`.
+- **Reproduced Nov 1:** building with exactly this Dockerfile gave the same patched `core.py` (`675dc58a…`) as the image the v2 measurements were taken with.
+
 ## Step 5: copy to the other nodes
 
 Both receiving nodes pull from node1 over their own ring cable at the same time: node0 over C1, node2 over C2.
@@ -321,15 +427,35 @@ ssh <user>@$NODE1 'docker save beam-tp3:v1' | docker load
 
 ## Step 6: launch
 
-On every node:
-1. Confirm no GPU processes are running (`nvidia-smi`).
-2. Then run the same script with that node's rank. It refuses to start unless every check passes: image present, checkpoint present, ring ports up, no other GPU process, and at least 109 GiB free after dropping the page cache.
+The launcher refuses to start a node unless every check passes: image present, checkpoint present, ring ports up, no other GPU process, and at least 109 GiB free after dropping the page cache. Confirm no GPU processes are running first (`nvidia-smi`). If it says a `beam-tp3` container already exists, stop it gracefully with Step 8; the message says the same.
+
+**One command from node0 (v2).** Copy the example settings once, fill in the first block (SSH targets, node0's LAN address, repo paths) and set `KV_BYTES` (the example holds our 4.5 GiB; start at 4.0 GiB, [Choosing the KV-cache size](#choosing-the-kv-cache-size)):
 
 ```bash
-NODE_RANK=0 MASTER_ADDR=<node0 LAN address> bash scripts/launch_node_v0_1_4.sh   # on node0
-NODE_RANK=1 MASTER_ADDR=<node0 LAN address> bash scripts/launch_node_v0_1_4.sh   # on node1
-NODE_RANK=2 MASTER_ADDR=<node0 LAN address> bash scripts/launch_node_v0_1_4.sh   # on node2
+cp scripts/cluster_v2.conf.example scripts/cluster.conf && nano scripts/cluster.conf
+tmux new -s beam          # recommended: the script waits about 17 minutes for the server
+bash scripts/start_all_v1_0_1.sh
 ```
+
+- It starts node0, then node1, then node2, asking each node's `sudo` password once, and stops before the next node if a container is not running.
+- Type each password as soon as it is asked. node0's server waits for the other two to join; on Nov 1 we left node1's prompt unanswered for about 20 minutes and node0's server had exited (code 1) by the time we came back. We did not measure the exact limit. If that happens, run `scripts/stop_all_v1_0_1.sh` (it reports `ALREADY_EXITED`) and start again.
+- It first checks all three nodes (reachable, launcher present, image present, no container left over) and starts nothing if any check fails.
+- **Pass:** `PREFLIGHT_OK` for ranks 0–2, each node's launcher output containing `STARTED beam-tp3`, `CONTAINER_RUNNING` for all three ranks, `PAGECACHE_HELPER_RUNNING` on all three nodes, one line a minute until `health=200`, then `GPU KV cache size: …` and `START_ALL_READY`.
+- Its settings come from `scripts/cluster.conf`; the example holds our v2 settings of record. Choose `KV_BYTES` for your nodes with [Memory margin](#memory-margin) first.
+- **If `cluster.conf` does not set `GPU_UTIL`,** the script derives it from the largest `MemTotal` on the three nodes (107.7 GiB ÷ `MemTotal`, rounded down to three decimals: 0.885 at the default 2 GB display memory, 0.874 at 0.5 GB) and prints the value it used.
+- **What we ran:** on Nov 1 we started our cluster with `start_all_v1_0_0.sh` (the version before this one) and a `cluster.conf` made from the example. The first start after Step 0b failed in vLLM's start-up memory check at `GPU_UTIL` 0.885 (Step 0b part 2); with `GPU_UTIL=0.874`: `PREFLIGHT_OK` on all three ranks, `CONTAINER_RUNNING` and `PAGECACHE_HELPER_RUNNING` on all three nodes, then `START_ALL_READY` after 18 minutes, with the 524,552-token pool. v1.0.1 adds the `GPU_UTIL` derivation and clearer failure messages (CHANGELOG). Its own run, Nov 1 at `MAX_MODEL_LEN=262144` with `GPU_UTIL` left unset: it derived 0.874 from the nodes' memory, `PREFLIGHT_OK` / `STARTED` / `CONTAINER_RUNNING` / `PAGECACHE_HELPER_RUNNING` on all three, `START_ALL_READY` after 18 minutes (22:02:12 → 22:20:33).
+
+**Or by hand on each node**, node0 first (the v1 way, now with the v2 settings):
+
+```bash
+S="MASTER_ADDR=<node0 LAN address> KV_BYTES=4831838208 MAX_BATCHED=4096 RETENTION=4096 LONG_PREFILL=3584 PREFILL_INTERVAL=9"   # set this on each node
+S="$S GPU_UTIL=0.874"   # only if Display Reserved Memory is 0.5 GB (Step 0b); omit at the default 2 GB
+env $S IMG=beam-tp3:v1-sched1 NODE_RANK=0 bash scripts/launch_node_v0_2_1.sh   # on node0
+env $S NODE_RANK=1 bash scripts/launch_node_v0_2_1.sh                         # on node1
+env $S NODE_RANK=2 bash scripts/launch_node_v0_2_1.sh                         # on node2
+```
+
+With none of the v2 settings, `launch_node_v0_2_1.sh` launches exactly as v1's `launch_node_v0_1_4.sh` did.
 
 The settings that matter:
 
@@ -339,9 +465,14 @@ The settings that matter:
 | `--network host --ipc host --device /dev/infiniband --ulimit memlock=-1` | NCCL needs the host's RDMA devices and pinned memory |
 | `--moe-backend b12x` | FP4 mixture-of-experts kernels for this GPU generation, shipped inside FlashInfer |
 | `--kv-cache-dtype fp8` | Halves KV-cache memory; 9 KV heads cost 12.5% more than 8 would |
-| `--gpu-memory-utilization 0.885` | vLLM's share of unified memory; the rest stays with the OS and host processes. 0.88 left too little KV-cache memory on two of three launches; see [Memory margin](#memory-margin) |
+| `--gpu-memory-utilization 0.885` | vLLM's share of unified memory; the rest stays with the OS and host processes. 0.88 left too little KV-cache memory on two of three launches; see [Memory margin](#memory-margin). **0.874 with Display Reserved Memory at 0.5 GB** (Step 0b), which keeps the same claim in GiB |
 | `--max-model-len 131072 --max-num-seqs 4` | Our context and concurrency targets. Only 9 of 52 layers keep full-length KV; sliding-window layers keep 512 tokens. |
 | `--enforce-eager` | No CUDA-graph capture: shorter start-up and less memory, slower decode. Graphs are future work. |
+| `--kv-cache-memory-bytes 4831838208` (`KV_BYTES`, v2) | Pins the KV cache at 4.5 GiB per node instead of letting vLLM estimate it; see [Memory margin](#memory-margin) |
+| `--max-num-batched-tokens 4096` (`MAX_BATCHED`, v2) | Reads up to 4,096 prompt tokens per step instead of 2,048 |
+| `--prefix-cache-retention-interval 4096` (`RETENTION`, v2) | Keeps sliding-window cache checkpoints every 4,096 tokens, so a document stays cached after a long answer |
+| `--long-prefill-token-threshold 3584` (`LONG_PREFILL`, v2) | While other requests are active, a long prompt takes at most 3,584 of each step's 4,096 tokens, leaving room for new requests |
+| `--prefill-schedule-interval 9` (`PREFILL_INTERVAL`, v2; node0 needs `beam-tp3:v1-sched1`) | While requests are writing, a long prompt is read on 1 step in 9 and the other 8 are decode-only |
 | `VLLM_ENGINE_READY_TIMEOUT_S=3600` | Stops rank 0 giving up during the long, silent repack phase |
 | `--host 127.0.0.1` | The HTTP API listens on loopback only. Put an authenticated proxy in front of it if anything else needs access. The distributed control plane (master port 29510 and the worker sockets) still listens on the LAN interface without authentication, so firewall it to the three nodes. |
 
@@ -354,7 +485,7 @@ sudo ufw allow from <your admin machine> to any port 22 proto tcp
 sudo ufw default deny incoming; sudo ufw enable
 ```
 
-**Start-up time varies a lot.** With this script on Oct 21 (freshly rebooted nodes, settings as published), it took **17 minutes** from launch to `/health` returning 200, on both launches: the workers loaded their weights in about 4 minutes and node0 in about 15. Our first-ever launch (Oct 18) took an estimated 65–70 minutes, including a long phase with no log output after the weights loaded:
+**Start-up time varies a lot.** With `launch_node_v0_1_4.sh` on Oct 21 (freshly rebooted nodes, settings as published), it took **17 minutes** from launch to `/health` returning 200, on both launches: the workers loaded their weights in about 4 minutes and node0 in about 15. Our first-ever launch (Oct 18) took an estimated 65–70 minutes, including a long phase with no log output after the weights loaded:
 
 | First launch, Oct 18 | node0 | node1 | node2 |
 |---|---|---|---|
@@ -381,7 +512,19 @@ On node0: `bash scripts/smoke_test_v0_1_1.sh`
 
 Beam reasons before it answers, and reasoning tokens count against `max_tokens`. Our first long-context probe used `max_tokens: 60` and came back empty. The script allows 600.
 
+## Step 8: stop and restart
+
+From node0: `bash scripts/stop_all_v1_0_1.sh`
+
+- It stops all three containers at once with a 120-second grace period (`docker stop -t 120`), saves each node's container log to `~/beam_tp3_log_<time>.txt`, removes the containers, then drops each node's page cache, asking each node's `sudo` password once.
+- **Pass:** `STOPPED_AND_REMOVED exit_code=0` for all three nodes, then `MEM_BACK MEM_AVAILABLE_GIB=11x` for each, then `STOP_ALL_DONE`. `ALREADY_EXITED exit_code=N` means that server had stopped on its own before you ran the script (a crash or failed start); its log is still saved, and the run ends in `STOP_ALL_DONE_WITH_NOTES`. `DROP_FAILED` (usually a mistyped `sudo` password) ends it in `STOP_ALL_INCOMPLETE`; drop that node's cache by hand (`sync && echo 3 | sudo tee /proc/sys/vm/drop_caches`) before starting again. You can start again straight away (Step 6).
+- `KILLED_AFTER_TIMEOUT` (exit code 137: the server did not stop within 120 s and was killed) or `MEM_HELD` on a node: reboot that node before relaunching. `UNREACHABLE`: that node was not stopped; stop it on the node itself.
+- **v1 said to reboot every node after stopping. That was for `docker rm -f`, which kills the server.** A graceful stop returned the memory on every stop we ran from Oct 28 to Oct 31. If a node still prints `MEM_HELD`, reboot that node before relaunching.
+- By hand on each node: `docker stop -t 120 beam-tp3 && docker rm beam-tp3 && sync && echo 3 | sudo tee /proc/sys/vm/drop_caches`.
+
 ## Results
+
+**v2 (Oct 28–31, 2026):** see [What's new in v2](#whats-new-in-v2-nov-2-2026), [Concurrency and long prompts](#concurrency-and-long-prompts) and the full tables in [results/v2_20261031/README.md](results/v2_20261031/README.md). **Legal agent (Oct 24 – Nov 2):** [results/legal_agent_eval_20261102/README.md](results/legal_agent_eval_20261102/README.md). Everything below this line is the v1 measurement set (Oct 18–21, 2026), unchanged, except the v2 part of [Memory margin](#memory-margin).
 
 Measured Oct 18–21, 2026 on the hardware above.
 
@@ -480,9 +623,83 @@ vLLM gives itself `GPU_UTIL` × 121.69 GiB on each node (107.7 GiB at 0.885). We
 | Oct 21, 21:15 (published settings) | **0.885** | **2.44 / 1.35 / 1.82 GiB** | **started**; smallest node 36% above what 131K needs |
 | Oct 21, 21:47 (published settings, repeat) | **0.885** | **2.35 / 1.36 / 1.56 GiB** | **started**; 180,048-token pool |
 
-- The figure swings by up to about 1.2 GiB between launches of identical settings. Leftover page cache is part of it (the helper raised node0 from 0.8 to 1.42 GiB at the same setting); the rest we have not pinned down. Node1 also runs unrelated services in our setup.
-- **If you hit the error:** raise `GPU_UTIL` to 0.89 (+1.2 GiB per node, taken from the OS; vLLM refuses to start if free memory at launch is below `GPU_UTIL` × 121.69 GiB, about 108.3 GiB at 0.89), or lower `MAX_MODEL_LEN` to the estimate vLLM prints. Freeing memory on the nodes (for example, running without a desktop session, about 2–3 GB) also helps.
-- **Stopping does not give the memory back.** After `docker rm -f beam-tp3`, whether the server had crashed or was running normally, about 105 GiB per node stayed in use with no process holding it (only the NVIDIA persistence daemon and the desktop had the GPU open), and restarting `nvidia-persistenced` did not release it. **Reboot every node before relaunching.** Whether a graceful `docker stop -t 120` avoids this is untested.
+- The figure swings by up to about 1.2 GiB between launches of identical settings. Leftover page cache is part of it (the helper raised node0 from 0.8 to 1.42 GiB at the same setting); the rest we have not pinned down. Other processes on a node also reduce it.
+- **If you hit the error (v1 settings, default 2 GB display memory):** raise `GPU_UTIL` to 0.89 (+0.6 GiB per node, taken from the OS; vLLM refuses to start if free memory at launch is below `GPU_UTIL` × 121.69 GiB, about 108.3 GiB at 0.89; at 0.5 GB display memory the same +0.005 steps apply from 0.874), or lower `MAX_MODEL_LEN` to the estimate vLLM prints. Better: pin the KV cache (below).
+- **Correction to v1:** v1 said a desktop session costs about 2–3 GB. We measured 0.22–0.25 GiB per node (Oct 28). Running headless is not needed.
+- **Correction to v1:** v1 said stopping does not give the memory back and every node must be rebooted. That happened after `docker rm -f`, which kills the server. A graceful stop (`docker stop -t 120`, then `docker rm`, then dropping the page cache; [Step 8](#step-8-stop-and-restart)) returned the memory on every stop we recorded (the stop table in [results/v2_20261031/README.md](results/v2_20261031/README.md)), with no reboot.
+
+**v2: pin the KV cache instead.** `KV_BYTES` sets `--kv-cache-memory-bytes`, so vLLM uses exactly that much per node for the KV cache and skips its estimate (the log says it "skipped memory profiling"). The pool no longer swings between launches.
+
+| Pinned per node | Step size (`MAX_BATCHED`) | Pool | Full 131K requests |
+|---|---|---|---|
+| 3.0 GiB | 2048 | 396,153 tokens | 3.02 |
+| 4.0 GiB | 2048 | 528,205 tokens | 4.03 |
+| 4.0 GiB | 4096 | 466,273 tokens | 3.56 |
+| **4.5 GiB (v2)** | **4096** | **524,552 tokens** | **4.00** |
+
+- **About 132,000 tokens per GiB at 2,048-token steps and about 117,000 at 4,096.** Larger steps cost pool because 43 of Beam's 52 layers use a 512-token sliding window, and vLLM reserves window-plus-step blocks for every running request from the same pool (our reading; the figures are measured).
+- **Lowest free memory at 4.5 GiB** while reading 100K-token prompts with two other requests writing: 2.07 / 4.33 / 3.83 GiB on node0 / node1 / node2 (Oct 31).
+- **Display Reserved Memory at 0.5 GB** ([Step 0b](#step-0b-firmware-display-memory-and-a-gpu-clock-cap-what-we-changed-on-nov-1)) adds about 1.5 GiB of `MemTotal` per node (121.69 → 123.19 GiB). With it, set `GPU_UTIL=0.874` so vLLM's start-up claim stays at about 107.7 GiB. We kept `KV_BYTES` at 4.5 GiB and left the extra memory as margin. Lowest free memory after the change, one run: 2.96 / 4.78 / 4.33 GiB on node0 / node1 / node2, against 2.07 / 4.33 / 3.83 before (less than the 1.5 GiB added; not explained, one run each).
+
+#### Choosing the KV-cache size
+
+1. Start at `KV_BYTES=4294967296` (4.0 GiB) with the other v2 settings.
+2. Run `BENCH_NODES="node0=local node1=<user>@<node1> node2=<user>@<node2>" python3 -I scripts/bench_v1_3_0.py try1` on node0 (about 4 minutes, server otherwise idle) three times, and take each node's lowest `MIN_MEMAVAILABLE_GIB`.
+3. If every node stays at or above 2.5 GiB, you can add 0.5 GiB (536,870,912 bytes), restart and measure again. Keep at least 1 GiB free on every node in the worst run.
+- **Our 4.5 GiB is one step past rule 3:** at 4.0 GiB node0's lowest was 2.39 GiB (one run). We went to 4.5 GiB anyway, measured 2.07 GiB lowest on node0 (Oct 31), and, after Step 0b, 2.71 GiB lowest in the last cycle of a 2-hour soak ([results/v2_20261031/README.md](results/v2_20261031/README.md)). The rule is the cautious version for nodes you have not measured.
+- **Why so much margin:** between two runs at the same `KV_BYTES` (4.0 GiB) but different step settings, the lowest free memory moved by up to about 1.7 GiB on a node: node0 fell 1.4 GiB (3.84 → 2.39) while node2 rose 1.7 GiB (2.18 → 3.86). One run each, so we cannot separate the step size's effect from run-to-run variation.
+- **Why a too-large value is dangerous:** a pinned size bypasses vLLM's own check, so a value that is too large fails while serving, not at start-up. On unified memory, running short tends to stall a node rather than fail cleanly.
+
+## Concurrency and long prompts
+
+**What v1 did with several requests at once.** vLLM runs one step at a time across all three nodes. Each step serves every request that is writing (one token each) plus up to 2,048 tokens of any prompt being read. On these nodes a step that reads part of a prompt takes about 1 s, against about 0.08 s for a step that only writes, so while one request's 100K-token prompt was being read:
+- every request already writing got one token per second (measured 13.1 → 1.08 tokens/s per request);
+- a new request, even a one-line question, waited until the whole prompt was read (measured 49.4 s);
+- asking the same document a new question after a long answer re-read it from scratch (measured 51.2 s).
+
+**What v2 changes, and the trade-offs:**
+
+| Problem | v2 setting | Measured effect | Cost |
+|---|---|---|---|
+| Same document, new question, re-read in full | `--prefix-cache-retention-interval 4096` | 51.2 s → 0.5 s (one document; a branch can re-read up to about 4K tokens, about 2 s, calculated) | A cached long document keeps more sliding-window blocks in each node's pool (not measured) |
+| New requests wait behind a long read | `--long-prefill-token-threshold 3584` with `--max-num-batched-tokens 4096` | 49.4 s → 4.6 s for a one-line question (one run, nothing else writing) | None measured |
+| Requests already writing crawl during a long read | `--prefill-schedule-interval 9` (node0: `beam-tp3:v1-sched1`) | 1.08 → 3.97 tokens/s per request | That read takes 65.0 s while two requests write, against about 45 s with the interval off (calculated); alone it is not slowed (46.4 s measured) |
+| Reading speed | `--max-num-batched-tokens 4096` | 50.9 s → 46.4 s for 100K tokens | Pool needs 4.5 GiB instead of 4.0 GiB for about 525K tokens; lowest free memory also moved between those runs (one run each, so not attributable to the step size; see [Memory margin](#memory-margin)) |
+
+**When the cap applies.** In this build the long-prompt cap is skipped when only one request is present (`scheduler.py`: the threshold is used only `if num_eligible_reqs > 1`), so a prompt read on its own still uses the full 4,096 tokens per step.
+
+**Why the cache missed.** Sliding-window layers only need the last 512 tokens, and vLLM by default keeps that window only where the latest request ended (`--prefix-cache-retention-interval` 0). A follow-up turn continues from there and hits. A new question branches off where the document ends, but by then the answer has moved the window on and the blocks behind it were freed. With a checkpoint every 4,096 tokens, a branch re-reads at most about 4K tokens.
+
+**Why the scheduler needed a patch.** vLLM's scheduler can already pause a partly-read prompt so that only writing requests run in that step (`defer_prefills` in `vllm/v1/core/sched/scheduler.py`); it does so only when at least one request is writing, so a prompt read on its own is never slowed. In this build, the engine turns that on only in data-parallel deployments: the single-replica `EngineCore._should_throttle_prefills` "never throttles otherwise". `docker/Dockerfile.sched1` makes it honour `--prefill-schedule-interval` too.
+
+**Choosing the interval.** One prompt-reading step costs about 0.15 s plus 0.41 ms per token; a write-only step with two requests writing costs about 0.078 s (a two-point fit to our runs; it agrees with the measured interval-5 and interval-9 results within 5%). For a 100K-token prompt read while two requests write:
+
+| `PREFILL_INTERVAL` | Each writing request during the read | That read |
+|---|---|---|
+| 1 (off) | about 0.6 tokens/s (calculated at the 3,584-token capped step) | about 45 s |
+| 5 | **2.63 tokens/s (measured)** | **55.8 s (measured)** |
+| **9 (v2)** | **3.97 tokens/s (measured)** | **65.0 s (measured)** |
+| 13 | about 5.0 tokens/s (calculated) | about 72 s |
+| 17 | about 5.9 tokens/s (calculated) | about 80 s |
+
+- The extra read time is the writing itself: each write-only step gives every writing request a token and costs about 0.078 s. With this build's step costs, no setting makes both run at full speed at once; that would need a second copy of the model (six Sparks).
+- **vLLM turns the pausing off while requests are queued** (its own "capacity" rule): if prompts are waiting for a free slot, reads run every step until the queue clears. One document plus a few chats is covered; a backlog is not.
+- Speeds above are with two requests writing. More writing requests make each write-only step longer (about 0.125 s with four, from the v1 sweep).
+
+### Longer requests (`MAX_MODEL_LEN`)
+
+Every request takes KV-cache blocks from one shared pool as it grows, up to `MAX_MODEL_LEN`. Beam's own config allows 1,048,576 positions (`max_position_embeddings`; its 9 full-attention layers use no positional encoding, the other 43 see only the last 512 tokens). Our default is 131,072.
+
+The "GPU KV cache size: N tokens" line vLLM prints is not a fixed size: vLLM computes it as *how many full-length requests fit* × `MAX_MODEL_LEN` (in `vllm/v1/core/kv_cache_utils.py`). The memory behind it is the same 4.5 GiB (`KV_BYTES`) at every length. What changes is the share taken by the 43 sliding-window layers: each request reserves a fixed amount for them, whatever its length, so longer requests spread that fixed cost over more tokens.
+
+| `MAX_MODEL_LEN` | vLLM's "KV cache size" | Full-length requests at once (vLLM's figure) |
+|---|---|---|
+| 131,072 (default) | 524,552 tokens | 4.00 |
+| 262,144 (Nov 1) | 599,354 tokens | 2.29 |
+
+From those two lines (our arithmetic, not a vLLM output): each request reserves about 44,000 tokens' worth of blocks for the sliding-window layers, and the pool holds about 700,000 tokens of full-attention context in total. So, by vLLM's own accounting, at the same `KV_BYTES`: one or two requests can each reach 262,144; three at once can each reach about 189,000; four at once about 131,000. When requests outgrow the pool, vLLM pauses (preempts) one until another finishes; nothing fails, but that request waits.
+
+We ran our cluster at 262,144 from Nov 1: `start_all_v1_0_1.sh` started it in 18 minutes with the line above, and the benchmark matched the 131,072 runs (T1 47.6 s, T2 18.5 tok/s, T3 12.7 / 3.93 tok/s with a 65.9 s read, T4 4.7 s / 45.6 s; results file). Answer quality and speed beyond 131,072 tokens are not measured by us; a 250K-token prompt takes over two minutes to read at the rates above.
 
 ## Why it is built this way
 
@@ -496,6 +713,9 @@ vLLM gives itself `GPU_UTIL` × 121.69 GiB on each node (107.7 GiB at 0.885). We
 | **Change vLLM's vocabulary padding instead of the vocabulary** | The tokenizer and embedding tensors stay untouched, and no fake tokens exist | A one-line image patch |
 | **FP8 KV cache** | Halves KV memory on nodes with little room left after 103 GB of weights | Small numeric change in attention |
 | **`--enforce-eager`** | Faster start-up and less memory | Slower decode |
+| **Pinned KV cache (v2)** | vLLM's estimate swung by about 1.2 GiB between identical launches and gave a 180K-token pool; pinning gives a fixed 524,552-token pool | Bypasses vLLM's memory check, so the size must be chosen with margin |
+| **Patch one engine function instead of forking vLLM (v2)** | The pausing logic already exists in vLLM, built for data-parallel deployments; only the switch was missing for one replica | One more image to build; tied to this base image, and the build stops if the function changes |
+| **4,096-token steps with a 3,584-token cap (v2)** | Faster reading, and about 500 tokens of every step stay free for other requests while a long prompt is read | About 12% less pool per GiB than 2,048-token steps |
 | **Native multi-node vLLM, no Ray** | Fewer moving parts; Ray's memory reservations matter on unified memory | — |
 | **Pinned digests, throwaway download container, read-only source, no network for the padder** | The model, base image, download environment, host test tools, nccl-tests and benchmark datasets are pinned, and nothing in the build can change the source or reach the internet. The benchmark containers are recorded by digest in the results rather than fixed in the script. | Slightly longer commands |
 | **HTTP API on loopback only** | The model API is not exposed by default | Needs a proxy for remote access. The distributed control plane on the LAN is unauthenticated; firewall it to the three nodes. |
@@ -513,7 +733,16 @@ vLLM gives itself `GPU_UTIL` × 121.69 GiB on each node (107.7 GiB at 0.885). We
 | Pair tests fail over one cable | The cable joins two same-numbered ports | Re-cable port 0 to port 1 (NVIDIA's wiring) |
 | `STOP: image beam-tp3:v1 not found` | The launch script expects the image under that name | Build it with Step 4, or tag your existing image: `docker tag <image id> beam-tp3:v1` |
 | `ValueError: To serve at least one request with the model's max seq len (131072), (0.99 GiB KV cache is needed, which is larger than the available KV cache memory …` | vLLM's KV-cache estimate came out too small on at least one node | See [Memory margin](#memory-margin): raise `GPU_UTIL` by 0.005, or set `MAX_MODEL_LEN` to the "estimated maximum model length" the error prints |
-| After stopping or a failed start, `free -g` shows about 110 GiB used with no container and no GPU process | The driver does not return the memory of killed processes on our nodes | Reboot every node before relaunching |
+| After stopping or a failed start, `free -g` shows about 110 GiB used with no container and no GPU process | The server was killed (`docker rm -f`, a crash) rather than stopped | Reboot that node. Next time stop with `scripts/stop_all_v1_0_1.sh` (Step 8), which returned the memory every time we used it |
+| `STOP: image beam-tp3:v1-sched1 not found` (by hand) or `rank0 PREFLIGHT_NO_IMAGE` (from `start_all`) | Step 4b not run on node0 | Build it (Step 4b) |
+| Step 4b build fails with `core.py: FAILED` and `computed checksum did NOT match` (or `PATCH=FAIL …`) | node0's `beam-tp3:v1` was not built from the pinned base image in `docker/Dockerfile` | Rebuild `beam-tp3:v1` with Step 4 (or copy it from node1, Step 5); do not edit the hashes or force the patch |
+| `PREFILL_INTERVAL` set but requests still crawl during reads | node0 is not running `beam-tp3:v1-sched1`, or prompts are queued (vLLM then turns the pausing off) | Check `docker inspect -f '{{.Config.Image}}' beam-tp3` on node0; once the first request has been scheduled, the engine log prints `LOCAL PATCH sched1 active: prefill_schedule_interval=N` |
+| The KV pool is smaller than the table for the same `KV_BYTES` | A larger `MAX_BATCHED` reserves more sliding-window blocks per request | See [Memory margin](#memory-margin) |
+| `PAGECACHE_HELPER_MISSING` from `start_all` | The launcher's page-cache helper did not start or was stopped | Stop with Step 8 and start again. Without it, leftover page cache competes with the model while it loads |
+| A node switches off under load and its logs simply stop (no kernel, GPU or thermal message) | Reported by other DGX Spark owners too; cause not established | What we changed (unproven): [Step 0b](#step-0b-firmware-display-memory-and-a-gpu-clock-cap-what-we-changed-on-nov-1). Other owners report the clock cap helps; reports on firmware conflict. If it recurs, run NVIDIA's field diagnostic and contact NVIDIA support; owners with repeated power-offs were granted or requested RMAs. Log temperatures to a file flushed every few seconds so the last readings survive |
+| A GPU runs near 611 MHz under load after a power loss or reboot | Reported stuck state | Shut the node down, remove AC power for about 15 s, power on |
+| `ValueError: Free memory on device cuda:0 (…/123.19 GiB) on startup is less than desired GPU memory utilization (0.885, 109.02 GiB)` | Display Reserved Memory was lowered, so the memory total grew and so did vLLM's start-up claim | Set `GPU_UTIL=0.874`, or in general 107.7 ÷ the total the message prints ([Step 0b](#step-0b-firmware-display-memory-and-a-gpu-clock-cap-what-we-changed-on-nov-1)) |
+| `fwupdmgr`: `libfwupd version … does not match daemon …` | `fwupd` and `libfwupd` packages out of step | Install Ubuntu's current `fwupd` (check with `apt-get -s install fwupd` first that it changes nothing else) |
 | Long silence after the weights load | One-time in-process b12x expert repack | Wait. Keep `VLLM_ENGINE_READY_TIMEOUT_S=3600`. Don't lower memory or context limits in response. |
 | `NVRM` out-of-memory lines during start-up | Printed when `nvidia-smi` runs during loading | Watch `MemAvailable` and container state instead |
 | Empty answer to a long prompt | Reasoning used the whole `max_tokens` budget | Allow at least 600 tokens |
@@ -523,18 +752,20 @@ vLLM gives itself `GPU_UTIL` × 121.69 GiB on each node (107.7 GiB at 0.885). We
 
 1. **No full-model equivalence measurement yet.** The proof is analytic and the numeric test samples three blocks: one attention layer (layer 0), one dense layer and one expert; other attention-layer types were not sampled separately. Planned: serve the unpadded checkpoint at PP=3 (pipeline stages split by layer, so no divisibility problem) and compare per-token probabilities with this build at temperature 0. The same run gives a measured TP-versus-PP speed comparison.
 2. **Quality is measured by four public benchmarks, one pass each.** GPQA Diamond and IFBench are consistent with Reflection's published NVFP4 figures; GSM8K and HumanEval match a community 3-bit build. They do not measure quality on any particular real-world task, and run-to-run variation is not measured.
-3. **Eager mode only, one sweep.** All speed figures are with `--enforce-eager` (CUDA graphs off) from a single run with small samples. With several requests and long prompts, a newly arriving prompt pauses the others for up to about a second. Not tried: CUDA graphs, chunked-prefill tuning, speculative decoding.
-4. **Tight memory.** See [Memory margin](#memory-margin). After loading, one node had 2 GiB free and every node carried 3–4 GiB of swap (24-hour soak, at 0.88). Concurrency × context is bounded by 178,253 KV tokens. Long-run stability at 0.885 has not yet been soak-tested.
+3. **Eager mode only.** All speed figures are with `--enforce-eager` (CUDA graphs off). v1's sweep is a single run with small samples; v2's benchmark is one run per setting. Not tried: CUDA graphs, speculative decoding. Reflection publishes a speculative-decoding drafter for Beam, [`reflection/Beam-1.0-501B-A23B-DFlash2`](https://huggingface.co/reflection/Beam-1.0-501B-A23B-DFlash2) (about 1.9B parameters, BF16); it is untested at TP=3. Its config has 40 attention heads, 8 key-value heads and a 17,408-wide MLP, none of which divide by 3, so it would likely need the same kind of padding as Beam. While another prompt is read, writing requests get about 4 tokens/s with the v2 settings (about 1 in v1); they cannot get full speed during a read on one copy of the model.
+4. **Tight memory.** See [Memory margin](#memory-margin). The v2 pool (524,552 tokens) is pinned and bypasses vLLM's memory check; the lowest free memory we measured was 2.07 GiB on node0. Soak result at the v2 settings: see [results/v2_20261031/README.md](results/v2_20261031/README.md).
 5. **Kernel behaviour on all-zero blocks is assumed, not proven.** The proof relies on each kernel mapping an all-zero FP4 block to zero. Outputs were finite and correct, but we did not audit every kernel.
 6. **Unexplained start-up variance.** One node loaded identical files about 8× slower than another (1,838 s against 224 s).
 7. **A slow management link.** One worker's LAN link negotiated 100 Mb/s. vLLM sends rendezvous and per-step scheduler messages to each worker over that link; its effect on decode latency is unmeasured.
 8. **Invalid message roles are accepted.** Reflection's verifier expects HTTP 400 for a message with an unknown role; vLLM's chat API accepts custom roles by design, so this build does too.
 9. **One repetition loop** appeared once in a chat session using tools and has not been root-caused. A candidate fix is the server variable `VLLM_BEAM_ALWAYS_CONSTRAIN_OUTPUT=0`.
-10. **n = 1:** one cluster, one launch.
+10. **n = 1:** one cluster.
+11. **The scheduler patch is tied to the pinned base image** and relies on vLLM's data-parallel pausing logic, which vLLM documents for data-parallel use. It was reviewed against this build's code and measured as above, not tested more widely. With prompts queued, vLLM turns the pausing off.
+12. **One unexplained hard power-off.** node0 switched off with no log entry about 18 minutes into the Oct 31 soak. Other owners report that a clock cap helps; reports on firmware conflict, and display memory is a memory change, not a power-off fix. After Step 0b a 2-hour soak at `MAX_MODEL_LEN=262144` ran 16 of 16 cycles with no power-off ([results/v2_20261031/README.md](results/v2_20261031/README.md)); one run does not show the changes prevent it.
 
 ## Related work and other builds
 
-**TP=3 on DGX Spark, other models.** All of these patch or fork vLLM, or pad at load time; this build pads the files and serves on the pinned upstream image plus a one-constant patch.
+**TP=3 on DGX Spark, other models.** All of these patch or fork vLLM, or pad at load time; this build pads the files and serves on the pinned upstream image plus a one-constant patch (v2: plus one engine function on node0).
 - [MiniMax M3 on 3 Sparks TP=3](https://forums.developer.nvidia.com/t/minimax-m3-on-3-sparks-tp-3-is-now-working/373388) (Jun 15, 2026): "virtual sharding" in Luke Alonso's vLLM fork, plus b12x.
 - [GLM-5.3-Flash NVFP4 on 3× DGX Spark TP=3](https://forums.developer.nvidia.com/t/glm-5-3-flash-nvfp4-on-3x-dgx-spark-tp-3-512k-context-35-tok-s/381534) (Aug 27, 2026): heads and experts padded via vLLM overlay files.
 - [DeepSeek-V4-Flash TP3 on 3× DGX Spark](https://huggingface.co/PrblyElect/DeepSeek-V4-Flash-TP3-3x-DGX-Spark) (Oct 2026): padding in a patched or forked vLLM.
@@ -555,7 +786,7 @@ vLLM gives itself `GPU_UTIL` × 121.69 GiB on each node (107.7 GiB at 0.885). We
 
 **Built on:**
 - [Reflection](https://reflection.ai/blog/introducing-beam): the model.
-- [vLLM](https://github.com/vllm-project/vllm): serving.
+- [vLLM](https://github.com/vllm-project/vllm): serving, including the prefill-deferral logic (built for data-parallel balancing) that v2's scheduler patch switches on for a single replica.
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) and **Luke Alonso's [b12x](https://pypi.org/project/b12x/)** kernels, which ship inside FlashInfer: the FP4 MoE path.
 - NVIDIA's [three-Spark ring playbook](https://build.nvidia.com/spark/connect-three-sparks/three-sparks-ring): the wiring.
 - **eugr and dbsci** on the NVIDIA developer forum: the switchless-ring NCCL settings this build uses ([Mar 31](https://forums.developer.nvidia.com/t/test-the-sample-about-connect-three-dgx-spark-in-a-ring-topology/365160) and [Apr 1, 2026](https://forums.developer.nvidia.com/t/three-node-spark-clusters-without-a-switch-are-now-supported-in-spark-vllm-docker-and-sparkrun/365296)).
@@ -580,8 +811,8 @@ To cite this repo, use GitHub's "Cite this repository" button, which reads [CITA
 **How this was made:** architected, orchestrated, reviewed, approved, tested and validated by Josh Pearlman on his own three-node DGX Spark cluster. Code and documentation drafted with Claude (Anthropic).
 
 **Licence:**
-- Code (`scripts/`, `docker/`, `CITATION.cff`, `REUSE.toml`): [Apache-2.0](LICENSES/Apache-2.0.txt).
-- Documentation and results (`README.md`, `docs/`, `results/`): [CC BY 4.0](LICENSES/CC-BY-4.0.txt). Command examples in the documentation may also be used under Apache-2.0.
+- Code (`scripts/`, `docker/`, `CITATION.cff`, `REUSE.toml`): [Apache-2.0](LICENSES/Apache-2.0.txt). `docker/beam_sched1_patcher_v1_0_1.py` quotes four lines of vLLM's `vllm/v1/engine/core.py` (Apache-2.0, the vLLM contributors).
+- Documentation and results (`README.md`, `CHANGELOG.md`, `docs/`, `results/`): [CC BY 4.0](LICENSES/CC-BY-4.0.txt). Command examples in the documentation may also be used under Apache-2.0.
 - The Hugging Face model card and notice (`hf/`): Apache-2.0, matching the model repository they ship in.
 - See [REUSE.toml](REUSE.toml).
 - Beam's weights are Apache-2.0 from Reflection. This repo distributes no weights; the padded checkpoint is on Hugging Face (see Step 2).

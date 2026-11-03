@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+# cluster_v2.conf.example - settings for start_all_v1_0_1.sh and stop_all_v1_0_1.sh (v2 recipe).
+# Copy to scripts/cluster.conf on node0, edit the first block and choose KV_BYTES in the second. The scripts run on node0 and reach node1 and node2
+# over passwordless SSH (README Step 0). The repo must be cloned on every node (REPO_DIR on node0, REMOTE_REPO_DIR on
+# node1 and node2). Optional, with their defaults: PORT=8600 LAN_IF=enP7s7 MAX_MODEL_LEN=131072
+# GPU_UTIL (default: derived from MemTotal by start_all_v1_0_1.sh; see below)
+# MODEL=/srv/models/tp3/Beam-1.0-501B-A23B-NVFP4-TP3
+
+# --- your cluster ---------------------------------------------------------------------------------
+NODE1_SSH="<user>@<node1 LAN address>"        # how node0 reaches node1 (rank 1)
+NODE2_SSH="<user>@<node2 LAN address>"        # how node0 reaches node2 (rank 2)
+MASTER_ADDR="<node0 LAN address>"              # node0's address on LAN_IF (enP7s7 by default)
+REPO_DIR="$HOME/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark"   # repo path on node0
+REMOTE_REPO_DIR="~/Beam-1.0-501B-A23B-NVFP4-TP3-3x-DGX-Spark" # path on node1/node2; "~" expands on that node
+
+# --- v2 settings of record (measured Oct 30-31, 2026; README "Concurrency and long prompts") ---------
+IMG_RANK0="beam-tp3:v1-sched1"   # node0 runs the engine; built from docker/Dockerfile.sched1
+IMG_WORKERS="beam-tp3:v1"        # node1 and node2 only run model shards
+KV_BYTES=4831838208              # 4.5 GiB of KV cache per node -> 524,552 tokens at MAX_BATCHED=4096 on our nodes.
+                                 # Choose yours with README "Choosing the KV-cache size"; start at 4294967296 (4.0 GiB).
+MAX_BATCHED=4096                 # tokens per engine step (vLLM default here: 2048)
+RETENTION=4096                   # keep sliding-window cache checkpoints every 4096 tokens
+LONG_PREFILL=3584                # a long prompt takes at most 3584 of the 4096 per step while others are active
+PREFILL_INTERVAL=9               # while requests are writing, read a long prompt on 1 step in 9 (needs IMG_RANK0)
+PROF_DIR=""                      # optional: a host folder to enable the torch profiler (idle until /start_profile)
+# GPU_UTIL=0.874                 # normally leave unset: start_all_v1_0_1.sh derives it as 107.7 GiB / MemTotal (0.885 at
+                                 # the default 2 GB display memory, 0.874 at 0.5 GB; README Step 0b) and prints it.
+                                 # Set it only to override.
